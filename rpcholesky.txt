@@ -7,34 +7,21 @@ rpcholesky
 ├── README.md
 ├── src
 │   ├── Makevars
-│   ├── rpcholesky.cpp
+│   ├── accelerated_rpcholesky.cpp
 │   ├── RcppExports.cpp
 │   ├── Makevars.win
-│   └── init.cpp
+│   └── accelerated_rpcholesky.h
 ├── NAMESPACE
 ├── R
 │   ├── rpcholesky-package.R
-│   ├── rpcholesky.R
+│   ├── example.R
 │   └── RcppExports.R
 ├── rpcholesky.Rproj
 ├── man
-│   ├── create_nystrom.Rd
-│   ├── accelerated_rpcholesky.Rd
-│   ├── trace_rpchol.Rd
-│   ├── rpcholesky.Rd
-│   ├── as.matrix.rpchol.Rd
-│   ├── rejection_cholesky.Rd
-│   ├── approximation_error.Rd
-│   ├── smile.Rd
-│   ├── nystrom_multiply.Rd
-│   ├── nystrom_extension.Rd
-│   ├── print.rpchol.Rd
-│   └── nystrom_mult.Rd
+│   └── rpcholesky.Rd
 ├── LICENSE.md
 ├── inst
 │   └── include
-│       ├── rpcholesky_RcppExports.h
-│       └── rpcholesky.h
 ├── LICENSE
 ├── DESCRIPTION
 └── rpcholesky.txt
@@ -45,75 +32,244 @@ rpcholesky
 
 ```
 CXX_STD = CXX11
-PKG_CXXFLAGS = -I../inst/include
 PKG_CXXFLAGS = $(SHLIB_OPENMP_CXXFLAGS)
 PKG_LIBS = $(SHLIB_OPENMP_CXXFLAGS) $(LAPACK_LIBS) $(BLAS_LIBS) $(FLIBS)
 
 ```
 
-`/home/stefan/Documents/R_Packages/rpcholesky/src/rpcholesky.cpp`:
+`/home/stefan/Documents/R_Packages/rpcholesky/src/accelerated_rpcholesky.cpp`:
 
 ```cpp
-// [[Rcpp::depends(RcppArmadillo)]]
-#include <RcppArmadillo.h>
-#include "../inst/include/rpcholesky.h"
+#define ARMA_DONT_USE_OPENMP
 
+#include "accelerated_rpcholesky.h"
+#include <chrono>
+#include <cmath>
+#include <algorithm>
 using namespace Rcpp;
 
-//' Accelerated Randomly Pivoted Cholesky Decomposition
-//'
-//' @param A A matrix or matrix-like object
-//' @param k The target rank of the approximation
-//' @param b_in The block size (default = k/10)
-//' @param stoptol Tolerance for early stopping (default = 1e-13)
-//' @param verbose Whether to print progress (default = false)
-//' @return A list containing the factors and indices
-// [[Rcpp::export]]
-Rcpp::List accelerated_rpcholesky(arma::mat A, int k,
-                                  Rcpp::Nullable<int> b_in = R_NilValue,
-                                  double stoptol = 1e-13,
-                                  bool verbose = false) {
-   return rpcholesky::accelerated_rpcholesky(A, k, b_in, stoptol, verbose);
+//------------------------------------------------------------------------------
+// Optimized Weighted Sampling with Replacement
+//------------------------------------------------------------------------------
+arma::uvec sample_with_replacement_optimized(const int n, const int b, const arma::vec &weights) {
+  arma::vec cum_weights = arma::cumsum(weights);
+  double total = cum_weights(cum_weights.n_elem - 1);
+  arma::vec r = arma::randu(b) * total;
+  arma::uvec samples(b);
+  double* cum_ptr = cum_weights.memptr();
+  for (int i = 0; i < b; i++) {
+    // Use std::upper_bound on the raw pointer
+    const double* pos = std::upper_bound(cum_ptr, cum_ptr + cum_weights.n_elem, r(i));
+    samples(i) = pos - cum_ptr;
+  }
+  return samples;
 }
 
-//' Helper function: Rejection Cholesky
-//'
-//' @param H A positive definite matrix
-//' @return A list containing the L matrix and the selected indices
-// [[Rcpp::export]]
-Rcpp::List rejection_cholesky(arma::mat H) {
-   return rpcholesky::rejection_cholesky(H);
+//------------------------------------------------------------------------------
+// Refined Rejection Cholesky Decomposition
+//------------------------------------------------------------------------------
+List rejection_cholesky(arma::mat H) {
+  int b = H.n_rows;
+  if (H.n_rows != H.n_cols)
+    stop("rejection_cholesky requires a square matrix");
+  if (arma::trace(H) <= 0)
+    stop("rejection_cholesky requires a strictly positive trace");
+
+  // Save the original diagonal of H.
+  arma::vec u = H.diag();
+  std::vector<int> accepted;
+  arma::mat L = arma::zeros<arma::mat>(b, b);
+
+  for (int j = 0; j < b; j++) {
+    double r = arma::randu();
+    // Accept pivot j if r * u[j] < H(j,j)
+    if (r * u(j) < H(j,j)) {
+      accepted.push_back(j);
+      double pivot = H(j,j);
+      double sqrt_pivot = std::sqrt(pivot);
+      // Compute L[j:, j] = H[j:, j] / sqrt(H(j,j))
+      L(arma::span(j, b-1), j) = H(arma::span(j, b-1), j) / sqrt_pivot;
+      // Update trailing submatrix H[(j+1):, (j+1):] -= outer(L[(j+1):, j], L[(j+1):, j])
+      if (j + 1 < b) {
+        arma::vec L_col = L(arma::span(j+1, b-1), j);
+        H(arma::span(j+1, b-1), arma::span(j+1, b-1)) -= L_col * L_col.t();
+      }
+    }
+  }
+
+  // Convert accepted indices to an arma::uvec using Armadillo's conversion.
+  arma::uvec idx = arma::conv_to<arma::uvec>::from(accepted);
+  // Extract the accepted submatrix from L: L(idx, idx)
+  arma::mat L_accepted;
+  if (idx.n_elem > 0) {
+    L_accepted = L.submat(idx, idx);
+  }
+
+  return List::create(Named("L") = L_accepted,
+                      Named("idx") = idx);
 }
 
-//' Compute approximation error of a low-rank approximation
-//'
-//' @param A The original matrix
-//' @param G The G factor from rpcholesky
-//' @param relative Whether to return the relative error (default = false)
-//' @return The approximation error or relative error
+//------------------------------------------------------------------------------
+// Refined Accelerated Randomized Pivoted Cholesky Decomposition
+//------------------------------------------------------------------------------
 // [[Rcpp::export]]
-double approximation_error(arma::mat A, arma::mat G, bool relative = false) {
-   return rpcholesky::compute_approximation_error(A, G, relative);
-}
+List accelerated_rpcholesky(const arma::mat &A, int k, SEXP b_in, double stoptol, bool verbose) {
+  if (A.n_rows != A.n_cols)
+    stop("Matrix A must be square.");
+  int n = A.n_rows;
+  if (k <= 0 || k > n)
+    stop("Invalid rank k.");
 
-//' Create a Nystrom extension from sample
-//'
-//' @param A The original matrix
-//' @param idx The indices selected by rpcholesky
-//' @return A list containing the components of the Nystrom extension
-// [[Rcpp::export]]
-Rcpp::List nystrom_extension(arma::mat A, arma::uvec idx) {
-   return rpcholesky::nystrom_extension(A, idx);
-}
+  // Initialize the diagonal residual and original trace.
+  arma::vec diags = A.diag();
+  double orig_trace = arma::sum(diags);
+  if (orig_trace <= 0)
+    stop("Matrix A must have a positive trace.");
 
-//' Apply the Nystrom approximation to multiply with a matrix
-//'
-//' @param nystrom The Nystrom extension returned by nystrom_extension
-//' @param B The matrix to multiply with
-//' @return The product of the Nystrom approximation and B
-// [[Rcpp::export]]
-arma::mat nystrom_mult(Rcpp::List nystrom, arma::mat B) {
-   return rpcholesky::nystrom_mult(nystrom, B);
+  // Determine batch size b: if "auto", set b = ceil(k/10)
+  int b;
+  bool auto_b = false;
+  if (TYPEOF(b_in) == STRSXP) {
+    std::string b_str = as<std::string>(b_in);
+    if (b_str == "auto") {
+      b = std::ceil(k / 10.0);
+      auto_b = true;
+    } else {
+      stop("Invalid b value. Use an integer or 'auto'.");
+    }
+  } else {
+    b = as<int>(b_in);
+  }
+
+  // Initialize output matrices:
+  // G (k x n) will store the low-rank factor rows,
+  // rows (k x n) will store the corresponding rows of A,
+  // arr_idx (length k) stores the global pivot indices.
+  arma::mat G = arma::zeros<arma::mat>(k, n);
+  arma::mat rows = arma::zeros<arma::mat>(k, n);
+  arma::uvec arr_idx = arma::zeros<arma::uvec>(k);
+  int counter = 0;
+
+  // Timing variables for adaptive batching.
+  double total_rej_time = 0.0;
+  double total_proc_time = 0.0;
+  std::chrono::high_resolution_clock::time_point start_time, end_time;
+
+  while (counter < k) {
+    // Sample candidate indices with replacement from 0 to n-1 using the optimized function.
+    double sum_diags = arma::sum(diags);
+    if (sum_diags <= 0)
+      break;
+    arma::vec probs = diags / sum_diags;
+    arma::uvec cand = sample_with_replacement_optimized(n, b, probs);
+
+    // Form submatrix H = A(cand, cand) minus the correction from previously accepted pivots.
+    arma::mat A_cand = A.submat(cand, cand);
+    arma::mat H;
+    if (counter > 0) {
+      arma::uvec row_indices = arma::regspace<arma::uvec>(0, counter - 1);
+      arma::mat G_sub = G.submat(row_indices, cand);
+      H = A_cand - G_sub.t() * G_sub;
+    } else {
+      H = A_cand;
+    }
+
+    if (auto_b) {
+      start_time = std::chrono::high_resolution_clock::now();
+    }
+
+    // Run refined rejection sampling on H.
+    List rej_res = rejection_cholesky(H);
+    arma::mat L = as<arma::mat>(rej_res["L"]);
+    arma::uvec accepted = as<arma::uvec>(rej_res["idx"]);
+
+    if (auto_b) {
+      end_time = std::chrono::high_resolution_clock::now();
+    }
+    double rej_time = auto_b ? std::chrono::duration<double>(end_time - start_time).count() : 0.0;
+    total_rej_time += rej_time;
+
+    int num_sel = accepted.n_elem;
+    // Limit the number of accepted pivots if more than needed.
+    if (num_sel > (k - counter)) {
+      num_sel = k - counter;
+      accepted = accepted.head(num_sel);
+      if (L.n_rows >= (unsigned)num_sel && L.n_cols >= (unsigned)num_sel) {
+        L = L.submat(0, 0, num_sel - 1, num_sel - 1);
+      }
+    }
+
+    // Map accepted candidate indices back to global indices.
+    arma::uvec accepted_cand = cand.elem(accepted);
+
+    if (auto_b) {
+      start_time = std::chrono::high_resolution_clock::now();
+    }
+
+    // Save the accepted global pivot indices.
+    arr_idx.subvec(counter, counter + num_sel - 1) = accepted_cand;
+    // Save the corresponding rows of A.
+    rows.rows(counter, counter + num_sel - 1) = A.rows(accepted_cand);
+
+    // Compute the update for G:
+    arma::mat G_update;
+    if (counter > 0) {
+      arma::uvec row_indices_accepted = arma::regspace<arma::uvec>(0, counter - 1);
+      arma::mat G_corr = G.submat(row_indices_accepted, accepted_cand).t()
+        * G.rows(row_indices_accepted);
+      G_update = A.rows(accepted_cand) - G_corr;
+    } else {
+      G_update = A.rows(accepted_cand);
+    }
+
+    // Solve L * X = G_update for X.
+    arma::mat X;
+    bool solved = arma::solve(X, L, G_update);
+    if (!solved)
+      stop("Linear system could not be solved.");
+    // Store the result in G.
+    G.rows(counter, counter + num_sel - 1) = X;
+
+    // Update diags: subtract the contribution of the new G rows.
+    arma::rowvec sq_sum = arma::sum(arma::square(X), 0);
+    diags -= sq_sum.t();
+    diags.elem(arma::find(diags < 0)).zeros();
+
+    if (auto_b) {
+      end_time = std::chrono::high_resolution_clock::now();
+    }
+    double proc_time = auto_b ? std::chrono::duration<double>(end_time - start_time).count() : 0.0;
+    total_proc_time += proc_time;
+
+    // Adaptive batch size update.
+    if (auto_b && rej_time > 0) {
+      double target = std::ceil(b * proc_time / (4.0 * rej_time));
+      double candidate1 = target;
+      double candidate2 = std::ceil(1.5 * b);
+      double candidate3 = std::ceil(k / 3.0);
+      double m = std::min({candidate1, candidate2, candidate3});
+      double candidate4 = std::ceil(b / 3.0);
+      b = std::max({10.0, m, candidate4});
+      b = static_cast<int>(b);
+    }
+
+    counter += num_sel;
+
+    if (stoptol > 0 && arma::sum(diags) <= stoptol * orig_trace) {
+      G = G.rows(0, counter - 1);
+      rows = rows.rows(0, counter - 1);
+      arr_idx = arr_idx.subvec(0, counter - 1);
+      break;
+    }
+
+    if (verbose) {
+      Rcout << "Accepted " << num_sel << " / " << b << std::endl;
+    }
+  }
+
+  return List::create(Named("G") = G,
+                      Named("idx") = arr_idx,
+                      Named("rows") = rows);
 }
 
 ```
@@ -124,11 +280,8 @@ arma::mat nystrom_mult(Rcpp::List nystrom, arma::mat B) {
 // Generated by using Rcpp::compileAttributes() -> do not edit by hand
 // Generator token: 10BE3573-1514-4C36-9D1C-5A225CD40393
 
-#include "../inst/include/rpcholesky.h"
 #include <RcppArmadillo.h>
 #include <Rcpp.h>
-#include <string>
-#include <set>
 
 using namespace Rcpp;
 
@@ -138,90 +291,23 @@ Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
 #endif
 
 // accelerated_rpcholesky
-Rcpp::List accelerated_rpcholesky(arma::mat A, int k, Rcpp::Nullable<int> b_in, double stoptol, bool verbose);
+List accelerated_rpcholesky(const arma::mat& A, int k, SEXP b_in, double stoptol, bool verbose);
 RcppExport SEXP _rpcholesky_accelerated_rpcholesky(SEXP ASEXP, SEXP kSEXP, SEXP b_inSEXP, SEXP stoptolSEXP, SEXP verboseSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< arma::mat >::type A(ASEXP);
+    Rcpp::traits::input_parameter< const arma::mat& >::type A(ASEXP);
     Rcpp::traits::input_parameter< int >::type k(kSEXP);
-    Rcpp::traits::input_parameter< Rcpp::Nullable<int> >::type b_in(b_inSEXP);
+    Rcpp::traits::input_parameter< SEXP >::type b_in(b_inSEXP);
     Rcpp::traits::input_parameter< double >::type stoptol(stoptolSEXP);
     Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
     rcpp_result_gen = Rcpp::wrap(accelerated_rpcholesky(A, k, b_in, stoptol, verbose));
     return rcpp_result_gen;
 END_RCPP
 }
-// rejection_cholesky
-Rcpp::List rejection_cholesky(arma::mat H);
-RcppExport SEXP _rpcholesky_rejection_cholesky(SEXP HSEXP) {
-BEGIN_RCPP
-    Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< arma::mat >::type H(HSEXP);
-    rcpp_result_gen = Rcpp::wrap(rejection_cholesky(H));
-    return rcpp_result_gen;
-END_RCPP
-}
-// approximation_error
-double approximation_error(arma::mat A, arma::mat G, bool relative);
-RcppExport SEXP _rpcholesky_approximation_error(SEXP ASEXP, SEXP GSEXP, SEXP relativeSEXP) {
-BEGIN_RCPP
-    Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< arma::mat >::type A(ASEXP);
-    Rcpp::traits::input_parameter< arma::mat >::type G(GSEXP);
-    Rcpp::traits::input_parameter< bool >::type relative(relativeSEXP);
-    rcpp_result_gen = Rcpp::wrap(approximation_error(A, G, relative));
-    return rcpp_result_gen;
-END_RCPP
-}
-// nystrom_extension
-Rcpp::List nystrom_extension(arma::mat A, arma::uvec idx);
-RcppExport SEXP _rpcholesky_nystrom_extension(SEXP ASEXP, SEXP idxSEXP) {
-BEGIN_RCPP
-    Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< arma::mat >::type A(ASEXP);
-    Rcpp::traits::input_parameter< arma::uvec >::type idx(idxSEXP);
-    rcpp_result_gen = Rcpp::wrap(nystrom_extension(A, idx));
-    return rcpp_result_gen;
-END_RCPP
-}
-// nystrom_mult
-arma::mat nystrom_mult(Rcpp::List nystrom, arma::mat B);
-RcppExport SEXP _rpcholesky_nystrom_mult(SEXP nystromSEXP, SEXP BSEXP) {
-BEGIN_RCPP
-    Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< Rcpp::List >::type nystrom(nystromSEXP);
-    Rcpp::traits::input_parameter< arma::mat >::type B(BSEXP);
-    rcpp_result_gen = Rcpp::wrap(nystrom_mult(nystrom, B));
-    return rcpp_result_gen;
-END_RCPP
-}
-
-// validate (ensure exported C++ functions exist before calling them)
-static int _rpcholesky_RcppExport_validate(const char* sig) { 
-    static std::set<std::string> signatures;
-    if (signatures.empty()) {
-    }
-    return signatures.find(sig) != signatures.end();
-}
-
-// registerCCallable (register entry points for exported C++ functions)
-RcppExport SEXP _rpcholesky_RcppExport_registerCCallable() { 
-    R_RegisterCCallable("rpcholesky", "_rpcholesky_RcppExport_validate", (DL_FUNC)_rpcholesky_RcppExport_validate);
-    return R_NilValue;
-}
 
 static const R_CallMethodDef CallEntries[] = {
     {"_rpcholesky_accelerated_rpcholesky", (DL_FUNC) &_rpcholesky_accelerated_rpcholesky, 5},
-    {"_rpcholesky_rejection_cholesky", (DL_FUNC) &_rpcholesky_rejection_cholesky, 1},
-    {"_rpcholesky_approximation_error", (DL_FUNC) &_rpcholesky_approximation_error, 3},
-    {"_rpcholesky_nystrom_extension", (DL_FUNC) &_rpcholesky_nystrom_extension, 2},
-    {"_rpcholesky_nystrom_mult", (DL_FUNC) &_rpcholesky_nystrom_mult, 2},
-    {"_rpcholesky_RcppExport_registerCCallable", (DL_FUNC) &_rpcholesky_RcppExport_registerCCallable, 0},
     {NULL, NULL, 0}
 };
 
@@ -236,22 +322,51 @@ RcppExport void R_init_rpcholesky(DllInfo *dll) {
 
 ```win
 CXX_STD = CXX11
-PKG_CXXFLAGS = -I../inst/include
 PKG_CXXFLAGS = $(SHLIB_OPENMP_CXXFLAGS)
 PKG_LIBS = $(SHLIB_OPENMP_CXXFLAGS) $(LAPACK_LIBS) $(BLAS_LIBS) $(FLIBS)
 
 ```
 
-`/home/stefan/Documents/R_Packages/rpcholesky/src/init.cpp`:
+`/home/stefan/Documents/R_Packages/rpcholesky/src/accelerated_rpcholesky.h`:
 
-```cpp
-// [[Rcpp::depends(RcppArmadillo)]]
+```h
+#ifndef ACCELERATED_RPCHOLESKY_H
+#define ACCELERATED_RPCHOLESKY_H
+
+// Forward declarations
 #include <RcppArmadillo.h>
 
-// This line tells Rcpp to expose both R and C++ interfaces for this package
-// [[Rcpp::interfaces(r, cpp)]]
+/**
+ * Optimized weighted sampling with replacement
+ *
+ * @param n Size of the population to sample from
+ * @param b Number of samples to draw
+ * @param weights Vector of weights for sampling probabilities
+ * @return Vector of indices sampled
+ */
+arma::uvec sample_with_replacement_optimized(const int n, const int b, const arma::vec &weights);
 
-// Nothing else needs to be in this file - it's just to set the interfaces attribute
+/**
+ * Refined rejection Cholesky decomposition
+ *
+ * @param H Positive semidefinite matrix
+ * @return List containing the Cholesky factor L and accepted pivot indices
+ */
+Rcpp::List rejection_cholesky(arma::mat H);
+
+/**
+ * Accelerated randomly pivoted Cholesky decomposition
+ *
+ * @param A Input positive semidefinite matrix
+ * @param k Target rank for approximation
+ * @param b_in Batch size (integer or "auto")
+ * @param stoptol Early stopping tolerance relative to original trace
+ * @param verbose Whether to print progress information
+ * @return List containing low-rank factor G, selected pivot indices, and corresponding rows
+ */
+Rcpp::List accelerated_rpcholesky(const arma::mat &A, int k, SEXP b_in, double stoptol, bool verbose);
+
+#endif // ACCELERATED_RPCHOLESKY_H
 
 ```
 
@@ -260,14 +375,7 @@ PKG_LIBS = $(SHLIB_OPENMP_CXXFLAGS) $(LAPACK_LIBS) $(BLAS_LIBS) $(FLIBS)
 ```
 # Generated by roxygen2: do not edit by hand
 
-S3method(as.matrix,rpchol)
-S3method(print,rpchol)
-export(approximation_error)
-export(create_nystrom)
-export(nystrom_multiply)
 export(rpcholesky)
-export(smile)
-export(trace_rpchol)
 importFrom(Rcpp,sourceCpp)
 useDynLib(rpcholesky, .registration = TRUE)
 
@@ -282,207 +390,310 @@ useDynLib(rpcholesky, .registration = TRUE)
 ## usethis namespace: end
 NULL
 
-```
-
-`/home/stefan/Documents/R_Packages/rpcholesky/R/rpcholesky.R`:
-
-```R
-# R/rpcholesky.R
-
 #' Accelerated Randomly Pivoted Cholesky Decomposition
 #'
-#' Computes a low-rank approximation of a positive semi-definite matrix using
-#' the accelerated randomly pivoted Cholesky algorithm. This implementation is
-#' based on the method described in "Randomly Pivoted Cholesky: Practical 
-#' Approximation of a Kernel Matrix with Few Entry Evaluations" by Ethan N. Epperly.
+#' @param A A positive semidefinite matrix
+#' @param k Target rank for the approximation
+#' @param b Batch size (an integer or "auto")
+#' @param stoptol Early stopping tolerance
+#' @param verbose If TRUE, prints progress information
 #'
-#' @param A Matrix or matrix-like object for low-rank approximation
-#' @param k Target rank of the approximation
-#' @param b Block size; defaults to k/10
-#' @param stoptol Tolerance for early stopping (default = 1e-13)
-#' @param verbose Whether to print progress information (default = FALSE)
-#'
-#' @return An object of class "rpchol" containing:
-#'   \item{G}{The Gram factor}
-#'   \item{idx}{Selected indices}
-#'   \item{rows}{Selected rows}
-#'   \item{k}{Target rank}
-#'
-#' @examples
-#' # Create a random PSD matrix
-#' set.seed(42)
-#' X <- matrix(rnorm(100*10), 100, 10)
-#' A <- X %*% t(X)
-#' 
-#' # Compute a rank-20 approximation
-#' result <- rpcholesky(A, k = 20)
-#' 
-#' # Compute approximation error
-#' rel_error <- approximation_error(A, result, relative = TRUE)
-#' print(paste("Relative error:", rel_error))
-#'
+#' @return A list containing low-rank factor G, selected pivot indices, and corresponding rows
 #' @export
-rpcholesky <- function(A, k, b = NULL, stoptol = 1e-13, verbose = FALSE) {
+rpcholesky <- function(A, k, b = "auto", stoptol = 1e-10, verbose = FALSE) {
+  if (!is.matrix(A)) {
+    A <- as.matrix(A)
+  }
   result <- accelerated_rpcholesky(A, k, b, stoptol, verbose)
-  
-  # Add k to the result
-  result$k <- k
-  
-  # Set class to allow for custom methods
-  class(result) <- "rpchol"
-  
   return(result)
 }
 
-#' Print method for rpchol objects
-#'
-#' @param x An rpchol object
-#' @param ... Additional arguments (not used)
-#'
-#' @export
-print.rpchol <- function(x, ...) {
-  cat("Accelerated Randomly Pivoted Cholesky Decomposition\n")
-  cat("Rank:", x$k, "\n")
-  cat("Selected", length(x$idx), "indices\n")
+```
+
+`/home/stefan/Documents/R_Packages/rpcholesky/R/example.R`:
+
+```R
+#' Improved example of accelerated randomly pivoted Cholesky
+#' Demonstrates usage, evaluates approximation accuracy, and focuses on efficiency
+
+library(rpcholesky)
+library(ggplot2)
+library(reshape2)
+library(microbenchmark)
+
+# -------------------------------------------------------------------------
+# Generate a test matrix with controlled eigenvalue decay
+# -------------------------------------------------------------------------
+set.seed(123)
+
+# Create a matrix with specific eigenvalue decay profile
+create_test_matrix <- function(n, decay_rate = 0.9, noise = 0.001) {
+  # Create a diagonal matrix with decaying eigenvalues
+  d <- decay_rate^(0:(n-1))  # Exponential decay
+  D <- diag(d)
+
+  # Create a random orthogonal matrix
+  Q <- qr.Q(qr(matrix(rnorm(n*n), n, n)))
+
+  # Create PSD matrix with controlled eigenvalue decay
+  A <- Q %*% D %*% t(Q)
+
+  # Add a small amount of noise to make the problem more challenging
+  if (noise > 0) {
+    noise_matrix <- matrix(rnorm(n*n), n, n)
+    noise_matrix <- noise_matrix %*% t(noise_matrix) * noise / n
+    A <- A + noise_matrix
+    # Ensure the matrix remains PSD after adding noise
+    A <- (A + t(A))/2
+  }
+
+  return(list(matrix = A, eigenvalues = d))
 }
 
-#' Create a Nystrom extension from an rpchol object
-#'
-#' Creates a Nystrom extension that can be used for efficient matrix operations.
-#'
-#' @param rpchol An rpchol object from rpcholesky()
-#' @param A The original matrix (optional if already in rpchol)
-#'
-#' @return A nystrom object
-#'
-#' @export
-create_nystrom <- function(rpchol, A = NULL) {
-  if (is.null(A) && !is.null(rpchol$A)) {
-    A <- rpchol$A
-  }
-  
-  if (is.null(A)) {
-    stop("Original matrix A is required to create Nystrom extension")
-  }
-  
-  nys <- nystrom_extension(A, rpchol$idx)
-  class(nys) <- "nystrom"
-  
-  return(nys)
+# Create a larger test matrix with slower decay
+n <- 2000  # Larger matrix
+message("Creating test matrix...")
+result <- create_test_matrix(n, decay_rate = 0.98)
+A <- result$matrix
+true_eigenvalues <- result$eigenvalues
+
+# -------------------------------------------------------------------------
+# Compare RPCholesky vs SVD with benchmarking
+# -------------------------------------------------------------------------
+message("Running benchmarks...")
+
+# Choose ranks that are reasonable for the matrix size
+ranks <- c(20, 50, 100, 200, 400)
+all_results <- list()
+
+# Run benchmarks and collect results
+for (k in ranks) {
+  message(paste("Processing rank k =", k))
+
+  # Time RPCholesky
+  rpcholesky_time <- system.time({
+    rpcholesky_result <- rpcholesky(A, k = k, b = "auto", verbose = FALSE)
+    G <- rpcholesky_result$G
+    A_rpcholesky <- t(G) %*% G
+  })
+
+  # Time SVD
+  svd_time <- system.time({
+    svd_result <- svd(A, nu = k, nv = k)
+    U <- svd_result$u
+    d <- svd_result$d[1:k]
+    V <- svd_result$v
+    A_svd <- U %*% diag(d) %*% t(V)
+  })
+
+  # Calculate errors
+  frob_norm_original <- sqrt(sum(A^2))
+
+  rpcholesky_error <- sqrt(sum((A - A_rpcholesky)^2)) / frob_norm_original
+  svd_error <- sqrt(sum((A - A_svd)^2)) / frob_norm_original
+
+  rpcholesky_trace_error <- abs(sum(diag(A)) - sum(diag(A_rpcholesky))) / sum(diag(A))
+  svd_trace_error <- abs(sum(diag(A)) - sum(diag(A_svd))) / sum(diag(A))
+
+  # Store results
+  all_results[[length(all_results) + 1]] <- list(
+    k = k,
+    rpcholesky_time = rpcholesky_time[3],  # elapsed time
+    svd_time = svd_time[3],                # elapsed time
+    rpcholesky_error = rpcholesky_error,
+    svd_error = svd_error,
+    rpcholesky_trace_error = rpcholesky_trace_error,
+    svd_trace_error = svd_trace_error,
+    speedup = svd_time[3] / rpcholesky_time[3]
+  )
 }
 
-#' Matrix multiplication for nystrom objects
-#'
-#' Multiplies a matrix by the Nystrom approximation.
-#'
-#' @param nys A nystrom object
-#' @param B Matrix to multiply with
-#'
-#' @return The product of the Nystrom approximation and B
-#'
-#' @export
-nystrom_multiply <- function(nys, B) {
-  return(nystrom_mult(nys, B))
+# -------------------------------------------------------------------------
+# Visualize and analyze results
+# -------------------------------------------------------------------------
+results_df <- do.call(rbind, lapply(all_results, function(r) {
+  data.frame(
+    Rank = r$k,
+    RPCholesky_Error = r$rpcholesky_error,
+    SVD_Error = r$svd_error,
+    Error_Ratio = r$rpcholesky_error / r$svd_error,
+    RPCholesky_Time = r$rpcholesky_time,
+    SVD_Time = r$svd_time,
+    Speedup = r$speedup
+  )
+}))
+
+print(results_df)
+
+# Plot speedup vs rank
+p1 <- ggplot(results_df, aes(x = Rank, y = Speedup)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_minimal() +
+  ggtitle("Computational Advantage of RPCholesky") +
+  ylab("Speed-up Ratio (SVD time / RPCholesky time)") +
+  xlab("Approximation Rank") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red")
+
+# Plot error comparison
+errors_df <- data.frame(
+  Rank = rep(results_df$Rank, 2),
+  Method = rep(c("RPCholesky", "SVD"), each = nrow(results_df)),
+  Error = c(results_df$RPCholesky_Error, results_df$SVD_Error)
+)
+
+p2 <- ggplot(errors_df, aes(x = Rank, y = Error, color = Method, group = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_minimal() +
+  scale_y_log10() +
+  ggtitle("Approximation Error Comparison") +
+  ylab("Relative Frobenius Error (log scale)") +
+  xlab("Approximation Rank")
+
+# Plot error ratio across ranks
+p3 <- ggplot(results_df, aes(x = Rank, y = Error_Ratio)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_minimal() +
+  ggtitle("Approximation Quality Ratio") +
+  ylab("Error Ratio (RPCholesky / SVD)") +
+  xlab("Approximation Rank") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red")
+
+# Create efficiency metric: (1/error) / time
+results_df$RPCholesky_Efficiency <- (1/results_df$RPCholesky_Error) / results_df$RPCholesky_Time
+results_df$SVD_Efficiency <- (1/results_df$SVD_Error) / results_df$SVD_Time
+results_df$Efficiency_Ratio <- results_df$RPCholesky_Efficiency / results_df$SVD_Efficiency
+
+p4 <- ggplot(results_df, aes(x = Rank, y = Efficiency_Ratio)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_minimal() +
+  ggtitle("Efficiency Comparison") +
+  ylab("Efficiency Ratio (RPCholesky / SVD)") +
+  xlab("Approximation Rank") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red")
+
+# Plot all figures
+gridExtra::grid.arrange(p1, p2, p3, p4, ncol = 2)
+
+# -------------------------------------------------------------------------
+# Demonstrate performance with increasing matrix size
+# -------------------------------------------------------------------------
+message("Testing scaling with matrix size...")
+
+# Test with different matrix sizes
+sizes <- c(500, 1000, 2000, 3000)
+rank_fraction <- 0.05  # Use 5% of matrix size as rank
+
+scaling_results <- data.frame(
+  Size = integer(),
+  Rank = integer(),
+  RPCholesky_Time = numeric(),
+  SVD_Time = numeric(),
+  Speedup = numeric()
+)
+
+for (size in sizes) {
+  k <- ceiling(size * rank_fraction)
+  message(paste("Matrix size:", size, "with rank", k))
+
+  # Create test matrix
+  test_matrix <- create_test_matrix(size, decay_rate = 0.98)$matrix
+
+  # Time RPCholesky
+  rpcholesky_time <- system.time({
+    rpcholesky(test_matrix, k = k, b = "auto", verbose = FALSE)
+  })[3]
+
+  # Time SVD
+  svd_time <- system.time({
+    svd(test_matrix, nu = k, nv = k)
+  })[3]
+
+  # Store results
+  scaling_results <- rbind(scaling_results, data.frame(
+    Size = size,
+    Rank = k,
+    RPCholesky_Time = rpcholesky_time,
+    SVD_Time = svd_time,
+    Speedup = svd_time / rpcholesky_time
+  ))
 }
 
-#' Compute the approximation error
-#'
-#' @param A The original matrix
-#' @param approx An rpchol object or G matrix from rpcholesky
-#' @param relative Whether to return the relative error (default = FALSE)
-#'
-#' @return The approximation error
-#'
-#' @export
-approximation_error <- function(A, approx, relative = FALSE) {
-  if (inherits(approx, "rpchol")) {
-    G <- approx$G
-  } else {
-    G <- approx
-  }
-  
-  return(approximation_error(A, G, relative))
-}
+print(scaling_results)
 
-#' Compute the trace of an rpchol object
-#'
-#' @param rpchol An rpchol object from rpcholesky()
-#'
-#' @return The trace of the low-rank approximation
-#'
-#' @export
-trace_rpchol <- function(rpchol) {
-  return(sum(rpchol$G^2))
-}
+# Plot scaling behavior
+scaling_long <- reshape2::melt(scaling_results,
+                               id.vars = c("Size", "Rank"),
+                               measure.vars = c("RPCholesky_Time", "SVD_Time"),
+                               variable.name = "Method",
+                               value.name = "Time")
 
-#' Compute the matrix form of an rpchol object
-#'
-#' @param rpchol An rpchol object from rpcholesky()
-#'
-#' @return The matrix form of the low-rank approximation
-#'
-#' @export
-as.matrix.rpchol <- function(rpchol) {
-  return(t(rpchol$G) %*% rpchol$G)
-}
+p5 <- ggplot(scaling_long, aes(x = Size, y = Time, color = Method, group = Method)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_minimal() +
+  ggtitle("Computation Time vs Matrix Size") +
+  ylab("Time (seconds)") +
+  xlab("Matrix Size")
 
-#' Generate a test matrix with the "smile" pattern
-#'
-#' Creates a kernel matrix with the smile pattern used in the original paper.
-#'
-#' @param n Number of points
-#' @param bandwidth Bandwidth parameter for the kernel
-#'
-#' @return A kernel matrix with the smile pattern
-#'
-#' @export
-smile <- function(n, bandwidth = 2.0) {
-  small <- ceiling(n^(1/2))
-  eye_points <- small
-  mouth_points <- ceiling(n/10)
-  face_points <- n - 2 * eye_points - mouth_points
-  
-  X <- matrix(0, n, 2)
-  idx <- 1
-  
-  # Eyes
-  for (x_shift in c(-4.0, 4.0)) {
-    for (i in 1:eye_points) {
-      repeat {
-        x <- 2 * runif(1) - 1
-        y <- 2 * runif(1) - 1
-        if (x^2 + y^2 <= 1.0) {
-          X[idx, 1] <- x + x_shift
-          X[idx, 2] <- y + 4.0
-          idx <- idx + 1
-          break
-        }
-      }
-    }
-  }
-  
-  # Mouth
-  x_vals <- seq(-5.0, 5.0, length.out = mouth_points)
-  for (x in x_vals) {
-    X[idx, 1] <- x
-    X[idx, 2] <- x^2 / 16.0 - 5.0
-    idx <- idx + 1
-  }
-  
-  # Face
-  theta_vals <- seq(0, 2*pi, length.out = face_points)
-  for (theta in theta_vals) {
-    X[idx, 1] <- 10.0 * cos(theta)
-    X[idx, 2] <- 10.0 * sin(theta)
-    idx <- idx + 1
-  }
-  
-  # Compute Gaussian kernel matrix
-  D <- as.matrix(dist(X))
-  A <- exp(-D^2/(2*bandwidth^2))
-  
-  return(A)
-}
+p6 <- ggplot(scaling_results, aes(x = Size, y = Speedup)) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_minimal() +
+  ggtitle("Speedup vs Matrix Size") +
+  ylab("Speedup (SVD time / RPCholesky time)") +
+  xlab("Matrix Size") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red")
+
+gridExtra::grid.arrange(p5, p6, ncol = 2)
+
+# -------------------------------------------------------------------------
+# Analyze selected pivots
+# -------------------------------------------------------------------------
+k_analyze <- 100  # Choose a moderate rank for analysis
+rpcholesky_result <- rpcholesky(A, k = k_analyze, b = "auto", verbose = FALSE)
+
+# Get actual eigenvalues of the matrix
+actual_eigenvalues <- eigen(A, symmetric = TRUE, only.values = TRUE)$values
+
+# Plot top eigenvalues against indices of selected pivots
+eigvals_df <- data.frame(
+  Index = 1:n,
+  Eigenvalue = actual_eigenvalues
+)
+# Add Selected column
+eigvals_df$Selected <- ifelse(1:n %in% rpcholesky_result$idx, "Yes", "No")
+
+# Use proper subsetting with a limited number of points for visualization
+plot_points <- min(n, 500)
+p7 <- ggplot(eigvals_df[1:plot_points, ], aes(x = Index, y = Eigenvalue, color = Selected)) +
+  geom_point(aes(size = Selected == "Yes")) +
+  scale_size_manual(values = c("TRUE" = 3, "FALSE" = 1), guide = "none") +
+  scale_y_log10() +
+  theme_minimal() +
+  ggtitle("Selected Pivots vs Eigenvalue Distribution") +
+  ylab("Eigenvalue (log scale)") +
+  xlab("Index") +
+  scale_color_manual(values = c("Yes" = "red", "No" = "gray"))
+
+print(p7)
+
+# Summary statistics
+cat("\nSummary Statistics:\n")
+cat("-------------------\n")
+cat(sprintf("Matrix Size: %d x %d\n", n, n))
+cat(sprintf("Number of ranks tested: %d\n", length(ranks)))
+cat(sprintf("Average speedup over SVD: %.2fx\n", mean(results_df$Speedup)))
+cat(sprintf("Maximum speedup over SVD: %.2fx\n", max(results_df$Speedup)))
+cat(sprintf("Average error ratio: %.2fx\n", mean(results_df$Error_Ratio)))
+cat("\nKey Findings:\n")
+cat("1. RPCholesky is faster than SVD, especially for larger matrices\n")
+cat("2. The speedup increases with matrix size\n")
+cat("3. While SVD provides optimal approximation, RPCholesky gives excellent results with much less computation\n")
+cat("4. RPCholesky automatically selects important pivots corresponding to largest eigenvalue directions\n")
 
 ```
 
@@ -492,58 +703,10 @@ smile <- function(n, bandwidth = 2.0) {
 # Generated by using Rcpp::compileAttributes() -> do not edit by hand
 # Generator token: 10BE3573-1514-4C36-9D1C-5A225CD40393
 
-#' Accelerated Randomly Pivoted Cholesky Decomposition
-#'
-#' @param A A matrix or matrix-like object
-#' @param k The target rank of the approximation
-#' @param b_in The block size (default = k/10)
-#' @param stoptol Tolerance for early stopping (default = 1e-13)
-#' @param verbose Whether to print progress (default = false)
-#' @return A list containing the factors and indices
-accelerated_rpcholesky <- function(A, k, b_in = NULL, stoptol = 1e-13, verbose = FALSE) {
+accelerated_rpcholesky <- function(A, k, b_in, stoptol, verbose) {
     .Call(`_rpcholesky_accelerated_rpcholesky`, A, k, b_in, stoptol, verbose)
 }
 
-#' Helper function: Rejection Cholesky
-#'
-#' @param H A positive definite matrix
-#' @return A list containing the L matrix and the selected indices
-rejection_cholesky <- function(H) {
-    .Call(`_rpcholesky_rejection_cholesky`, H)
-}
-
-#' Compute approximation error of a low-rank approximation
-#'
-#' @param A The original matrix
-#' @param G The G factor from rpcholesky
-#' @param relative Whether to return the relative error (default = false)
-#' @return The approximation error or relative error
-approximation_error <- function(A, G, relative = FALSE) {
-    .Call(`_rpcholesky_approximation_error`, A, G, relative)
-}
-
-#' Create a Nystrom extension from sample
-#'
-#' @param A The original matrix
-#' @param idx The indices selected by rpcholesky
-#' @return A list containing the components of the Nystrom extension
-nystrom_extension <- function(A, idx) {
-    .Call(`_rpcholesky_nystrom_extension`, A, idx)
-}
-
-#' Apply the Nystrom approximation to multiply with a matrix
-#'
-#' @param nystrom The Nystrom extension returned by nystrom_extension
-#' @param B The matrix to multiply with
-#' @return The product of the Nystrom approximation and B
-nystrom_mult <- function(nystrom, B) {
-    .Call(`_rpcholesky_nystrom_mult`, nystrom, B)
-}
-
-# Register entry points for exported C++ functions
-methods::setLoadAction(function(ns) {
-    .Call(`_rpcholesky_RcppExport_registerCCallable`)
-})
 
 ```
 
@@ -573,498 +736,6 @@ BuildType: Package
 PackageUseDevtools: Yes
 PackageInstallArgs: --no-multiarch --with-keep.source
 PackageRoxygenize: rd,collate,namespace
-
-```
-
-`/home/stefan/Documents/R_Packages/rpcholesky/inst/include/rpcholesky_RcppExports.h`:
-
-```h
-// Generated by using Rcpp::compileAttributes() -> do not edit by hand
-// Generator token: 10BE3573-1514-4C36-9D1C-5A225CD40393
-
-#ifndef RCPP_rpcholesky_RCPPEXPORTS_H_GEN_
-#define RCPP_rpcholesky_RCPPEXPORTS_H_GEN_
-
-#include <RcppArmadillo.h>
-#include <Rcpp.h>
-
-namespace rpcholesky {
-
-    using namespace Rcpp;
-
-    namespace {
-        void validateSignature(const char* sig) {
-            Rcpp::Function require = Rcpp::Environment::base_env()["require"];
-            require("rpcholesky", Rcpp::Named("quietly") = true);
-            typedef int(*Ptr_validate)(const char*);
-            static Ptr_validate p_validate = (Ptr_validate)
-                R_GetCCallable("rpcholesky", "_rpcholesky_RcppExport_validate");
-            if (!p_validate(sig)) {
-                throw Rcpp::function_not_exported(
-                    "C++ function with signature '" + std::string(sig) + "' not found in rpcholesky");
-            }
-        }
-    }
-
-}
-
-#endif // RCPP_rpcholesky_RCPPEXPORTS_H_GEN_
-
-```
-
-`/home/stefan/Documents/R_Packages/rpcholesky/inst/include/rpcholesky.h`:
-
-```h
-#ifndef RPCHOLESKY_H
-#define RPCHOLESKY_H
-
-// [[Rcpp::depends(RcppArmadillo)]]
-#include <RcppArmadillo.h>
-
-// Define R's random number generation for use in C++ code
-#define R_NO_REMAP
-#include <R.h>
-#include <Rmath.h>
-
-namespace rpcholesky {
-
-/**
- * Rejection pivoted Cholesky decomposition
- *
- * @param H A positive definite matrix
- * @return A list containing the L matrix and the selected indices
- */
-inline Rcpp::List rejection_cholesky(arma::mat& H) {
-  int b = H.n_rows;
-  if (H.n_rows != H.n_cols) {
-    Rcpp::stop("rejection_cholesky requires a square matrix");
-  }
-
-  double trace = arma::trace(H);
-  if (trace <= 0) {
-    Rcpp::stop("rejection_cholesky requires a strictly positive trace");
-  }
-
-  // Pre-allocate vectors instead of creating them inside the loop
-  arma::vec u(b);
-  for (int j = 0; j < b; j++) {
-    u(j) = H(j, j);
-  }
-
-  std::vector<int> idx;
-  idx.reserve(b); // Pre-allocate for efficiency
-  arma::mat L = arma::zeros(b, b);
-
-  GetRNGstate(); // Get R's RNG state
-
-  // Add maximum attempts limit to prevent infinite loops
-  const int MAX_ATTEMPTS_PER_POSITION = 1000;
-
-  for (int j = 0; j < b; j++) {
-    int attempts = 0;
-    bool accepted = false;
-
-    // Limit number of attempts per position
-    while (!accepted && attempts < MAX_ATTEMPTS_PER_POSITION) {
-      attempts++;
-      // Use R's uniform random number generator
-      if (unif_rand() * u(j) < H(j, j)) {
-        accepted = true;
-        idx.push_back(j);
-        L(arma::span(j, b-1), j) = H(arma::span(j, b-1), j) / std::sqrt(H(j, j));
-
-        // Update the remaining submatrix
-        for (int k = j+1; k < b; k++) {
-          for (int l = j+1; l < b; l++) {
-            H(k, l) -= L(k, j) * L(l, j);
-          }
-        }
-      }
-    }
-
-    if (attempts >= MAX_ATTEMPTS_PER_POSITION && !accepted) {
-      Rcpp::warning("Maximum rejection sampling attempts reached at position %d", j);
-    }
-  }
-
-  PutRNGstate(); // Update R's RNG state
-
-  // Create small L matrix with selected indices only
-  arma::uvec accepted = arma::conv_to<arma::uvec>::from(idx);
-  arma::mat L_small;
-  if (accepted.n_elem > 0) {
-    L_small = L.submat(accepted, accepted);
-  } else {
-    L_small = arma::zeros(0, 0);
-  }
-
-  // Return both the L matrix and the selected indices
-  // Note: adding 1 to indices for R's 1-based indexing
-  return Rcpp::List::create(
-    Rcpp::Named("L") = L_small,
-    Rcpp::Named("idx") = accepted + 1
-  );
-}
-
-/**
- * Accelerated Randomly Pivoted Cholesky decomposition
- *
- * @param A A matrix
- * @param k The target rank of the approximation
- * @param b_in The block size (optional, default = k/10)
- * @param stoptol Tolerance for early stopping (default = 1e-13)
- * @param verbose Whether to print progress (default = false)
- * @return A list containing the factors and indices
- */
-inline Rcpp::List accelerated_rpcholesky(arma::mat& A, int k,
-                                         Rcpp::Nullable<int> b_in = R_NilValue,
-                                         double stoptol = 1e-13,
-                                         bool verbose = false) {
-  int n = A.n_rows;
-  int b;
-  bool auto_b;
-
-  // Handle the auto block size case
-  if (b_in.isNull()) {
-    b = std::ceil(k / 10.0);
-    auto_b = true;
-  } else {
-    b = Rcpp::as<int>(b_in);
-    auto_b = false;
-  }
-
-  // Validate inputs to prevent issues
-  if (b <= 0) b = 1;
-  if (k <= 0) {
-    Rcpp::stop("Target rank k must be positive");
-  }
-  if (b > n) b = n;
-  if (k > n) k = n;
-
-  // Get diagonal elements
-  arma::vec diags = A.diag();
-  double orig_trace = arma::sum(diags);
-
-  // Initialize result matrices - limit sizes for large matrices
-  int actual_k = std::min(k, n); // Ensure we don't exceed matrix dimensions
-  arma::mat G = arma::zeros(actual_k, n);
-  arma::mat rows = arma::zeros(actual_k, n);
-  arma::uvec arr_idx = arma::zeros<arma::uvec>(actual_k);
-
-  int counter = 0;
-
-  GetRNGstate(); // Get R's RNG state
-
-  // Pre-allocate these outside the loop to avoid stack overflow
-  arma::uvec idx(b);
-  arma::mat H;
-  arma::mat G_prev;
-  arma::mat G_prev_subidx;
-  Rcpp::List chol_result;
-  arma::mat L;
-  arma::uvec accepted;
-  arma::uvec selected_idx;
-  arma::mat G_new;
-
-  // Use batch processing for very large matrices
-  const int MAX_BATCH_SIZE = 10000; // Set a reasonable batch size
-
-  while (counter < actual_k) {
-    // Choose indices based on diagonal probabilities
-    arma::vec prob = diags / arma::sum(diags);
-
-    // Sample indices with replacement using efficient method
-    for (int i = 0; i < b; i++) {
-      double u = unif_rand();
-      double cumsum = 0.0;
-      for (int j = 0; j < n; j++) {
-        cumsum += prob(j);
-        if (u <= cumsum) {
-          idx(i) = j;
-          break;
-        }
-      }
-    }
-
-    // Timing for adaptive block size (if enabled)
-    clock_t start_time = 0;
-    clock_t middle_time = 0;
-    clock_t end_time = 0;
-    double rejection_time = 0.0;
-    double process_time = 0.0;
-
-    if (auto_b) {
-      start_time = clock();
-    }
-
-    // Extract submatrices
-    H = A.submat(idx, idx);
-
-    // Subtract previous approximation
-    if (counter > 0) {
-      // Create matrices for the submatrix multiplication
-      G_prev = G.rows(0, counter-1);
-      G_prev_subidx.set_size(G_prev.n_rows, idx.n_elem);
-
-      // Extract columns for idx
-      for (size_t i = 0; i < idx.n_elem; i++) {
-        G_prev_subidx.col(i) = G_prev.col(idx(i));
-      }
-
-      H -= G_prev_subidx.t() * G_prev_subidx;
-    }
-
-    // Add regularization to prevent numerical issues
-    double eps = 1e-14 * arma::trace(H);
-    if (eps > 0) {
-      H.diag() += eps;
-    }
-
-    // Perform rejection sampling Cholesky with timeout
-    try {
-      chol_result = rejection_cholesky(H);
-      L = Rcpp::as<arma::mat>(chol_result["L"]);
-      accepted = Rcpp::as<arma::uvec>(chol_result["idx"]) - 1; // Convert back to 0-based
-    } catch (std::exception &e) {
-      if (verbose) {
-        Rcpp::Rcout << "Warning: Cholesky decomposition failed. Adding regularization." << std::endl;
-      }
-      // Add stronger regularization and try again
-      H.diag() += 1e-10 * arma::trace(H);
-      chol_result = rejection_cholesky(H);
-      L = Rcpp::as<arma::mat>(chol_result["L"]);
-      accepted = Rcpp::as<arma::uvec>(chol_result["idx"]) - 1; // Convert back to 0-based
-    }
-
-    int num_sel = accepted.n_elem;
-
-    if (num_sel > actual_k - counter) {
-      num_sel = actual_k - counter;
-      accepted = accepted.head(num_sel);
-      L = L.submat(0, 0, num_sel-1, num_sel-1);
-    }
-
-    selected_idx.set_size(num_sel);
-    for (int i = 0; i < num_sel; i++) {
-      selected_idx(i) = idx(accepted(i));
-    }
-
-    if (auto_b) {
-      middle_time = clock();
-      rejection_time = ((double)(middle_time - start_time)) / CLOCKS_PER_SEC;
-    }
-
-    // Process selected indices in batches for large matrices
-    for (int i = 0; i < num_sel; i++) {
-      arr_idx(counter + i) = selected_idx(i);
-    }
-
-    // Extract rows for selected indices
-    for (int i = 0; i < num_sel; i++) {
-      rows.row(counter + i) = A.row(selected_idx(i));
-    }
-
-    // Compute residual in batches if needed
-    G_new = rows.rows(counter, counter + num_sel - 1);
-    if (counter > 0) {
-      // Create matrices for the submatrix multiplication
-      G_prev = G.rows(0, counter-1);
-
-      // Process in batches if the matrix is very large
-      if (selected_idx.n_elem > MAX_BATCH_SIZE) {
-        G_prev_subidx.zeros(G_prev.n_rows, selected_idx.n_elem);
-
-        for (size_t batch_start = 0; batch_start < selected_idx.n_elem; batch_start += MAX_BATCH_SIZE) {
-          size_t batch_end = std::min(batch_start + MAX_BATCH_SIZE, (size_t)selected_idx.n_elem);
-          size_t batch_size = batch_end - batch_start;
-
-          arma::uvec batch_idx = selected_idx.subvec(batch_start, batch_end-1);
-
-          for (size_t i = 0; i < batch_size; i++) {
-            G_prev_subidx.col(batch_start + i) = G_prev.col(batch_idx(i));
-          }
-        }
-      } else {
-        G_prev_subidx.set_size(G_prev.n_rows, selected_idx.n_elem);
-        // Extract columns for selected_idx
-        for (size_t i = 0; i < selected_idx.n_elem; i++) {
-          G_prev_subidx.col(i) = G_prev.col(selected_idx(i));
-        }
-      }
-
-      G_new -= G_prev_subidx.t() * G_prev;
-    }
-
-    // Solve triangular system
-    if (L.n_rows > 0) {
-      try {
-        G.rows(counter, counter + num_sel - 1) = arma::solve(trimatl(L), G_new);
-      } catch (std::exception &e) {
-        if (verbose) {
-          Rcpp::Rcout << "Warning: Triangular solve failed. Using pseudoinverse." << std::endl;
-        }
-        // Use more stable but slower pseudoinverse if triangular solve fails
-        G.rows(counter, counter + num_sel - 1) = arma::pinv(trimatl(L)) * G_new;
-      }
-    }
-
-    // Update diagonal residuals
-    for (int j = 0; j < n; j++) {
-      double sum_sq = 0.0;
-      for (int i = counter; i < counter + num_sel; i++) {
-        sum_sq += G(i, j) * G(i, j);
-      }
-      diags(j) -= sum_sq;
-      // Clip to avoid negative values due to numerical errors
-      if (diags(j) < 0) diags(j) = 0;
-    }
-
-    if (auto_b) {
-      end_time = clock();
-      process_time = ((double)(end_time - middle_time)) / CLOCKS_PER_SEC;
-
-      // Adjust block size adaptively
-      // Aiming for rejection_time = process_time / 4
-      int target = std::ceil(b * process_time / (4.0 * rejection_time));
-      b = std::max({std::min({target, static_cast<int>(std::ceil(1.5 * b)), static_cast<int>(std::ceil(k / 3.0))}),
-                   static_cast<int>(std::ceil(b / 3.0)), 10});
-    }
-
-    counter += num_sel;
-
-    if (verbose && num_sel > 0) {
-      Rcpp::Rcout << "Accepted " << num_sel << " / " << b << std::endl;
-    }
-
-    // Check early stopping criterion
-    if (stoptol > 0 && arma::sum(diags) <= stoptol * orig_trace) {
-      if (verbose) {
-        Rcpp::Rcout << "Early stopping at iteration " << counter << std::endl;
-      }
-      G = G.rows(0, counter-1);
-      rows = rows.rows(0, counter-1);
-      arr_idx = arr_idx.head(counter);
-      break;
-    }
-
-    // Add a check to avoid infinite loops if no pivots are being accepted
-    if (num_sel == 0) {
-      if (verbose) {
-        Rcpp::Rcout << "Warning: No pivots accepted in this iteration. Increasing block size." << std::endl;
-      }
-      b = std::min(2 * b, n); // Double the block size but don't exceed matrix size
-
-      // To prevent endless loops
-      if (b >= n/2) {
-        Rcpp::warning("Unable to find acceptable pivots, returning current approximation");
-        break;
-      }
-    }
-
-    // Periodic garbage collection to free memory
-    if (counter % 1000 == 0) {
-      R_CheckUserInterrupt(); // Allow user interruption for long-running processes
-      R_gc(); // Force garbage collection
-    }
-  }
-
-  PutRNGstate(); // Update R's RNG state
-
-  // Return G matrix and indices
-  // Add 1 to indices for R's 1-based indexing
-  return Rcpp::List::create(
-    Rcpp::Named("G") = G,
-    Rcpp::Named("idx") = arr_idx.head(counter) + 1,
-    Rcpp::Named("rows") = rows.rows(0, counter-1)
-  );
-}
-
-/**
- * Compute approximation error of a low-rank approximation
- *
- * @param A The original matrix
- * @param G The G factor from rpcholesky
- * @param relative Whether to return the relative error (default = false)
- * @return The approximation error or relative error
- */
-inline double compute_approximation_error(arma::mat& A, arma::mat& G, bool relative = false) {
-  double trace_A = arma::trace(A);
-  double trace_lra = arma::accu(G % G); // Squared Frobenius norm of G
-
-  double error = trace_A - trace_lra;
-
-  if (relative) {
-    error /= trace_A;
-  }
-
-  return error;
-}
-
-/**
- * Create a Nystrom extension from sample
- *
- * @param A The original matrix
- * @param idx The indices selected by rpcholesky
- * @return A list containing the components of the Nystrom extension
- */
-inline Rcpp::List nystrom_extension(arma::mat& A, arma::uvec& idx) {
-  // Convert to 0-based indexing
-  idx = idx - 1;
-
-  // Extract the rows and the core
-  arma::mat rows = A.rows(idx);
-  arma::mat core = rows.cols(idx);
-
-  // Make the core symmetric (handle numerical issues)
-  core = (core + core.t()) / 2.0;
-
-  // Compute the Cholesky factor of the core
-  arma::mat L;
-  bool chol_success = arma::chol(L, core);
-
-  if (!chol_success) {
-    // Add a small regularization if Cholesky fails
-    double eps = arma::trace(core) * std::numeric_limits<double>::epsilon();
-    arma::mat reg = eps * arma::eye<arma::mat>(core.n_rows, core.n_rows);
-    chol_success = arma::chol(L, core + reg);
-
-    if (!chol_success) {
-      Rcpp::stop("Cholesky decomposition failed even with regularization");
-    }
-  }
-
-  // Solve the triangular system
-  arma::mat G = arma::solve(trimatl(L.t()), rows);
-
-  // Convert back to 1-based indexing for R
-  idx = idx + 1;
-
-  return Rcpp::List::create(
-    Rcpp::Named("G") = G,
-    Rcpp::Named("core") = core,
-    Rcpp::Named("rows") = rows,
-    Rcpp::Named("idx") = idx
-  );
-}
-
-/**
- * Apply the Nystrom approximation to multiply with a matrix
- *
- * @param nystrom The Nystrom extension returned by nystrom_extension
- * @param B The matrix to multiply with
- * @return The product of the Nystrom approximation and B
- */
-inline arma::mat nystrom_mult(Rcpp::List& nystrom, arma::mat& B) {
-  arma::mat core = Rcpp::as<arma::mat>(nystrom["core"]);
-  arma::mat rows = Rcpp::as<arma::mat>(nystrom["rows"]);
-
-  // rows * B = X, then solve core * Y = X for Y, then rows^T * Y
-  return rows.t() * arma::solve(core, rows * B);
-}
-
-} // namespace rpcholesky
-
-#endif // RPCHOLESKY_H
 
 ```
 

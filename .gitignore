@@ -50,4 +50,5 @@ rsconnect/
 .Rproj.user
 
 # Misc. files
-exmample.R
+example.R
+R/example.R

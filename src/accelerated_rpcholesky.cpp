@@ -1,4 +1,5 @@
-// [[Rcpp::depends(RcppArmadillo)]]
+#define ARMA_DONT_USE_OPENMP
+
 #include "accelerated_rpcholesky.h"
 #include <chrono>
 #include <cmath>
