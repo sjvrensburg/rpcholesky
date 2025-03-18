@@ -1,0 +1,19 @@
+Package: rpcholesky
+Title: Accelerated Randomly Pivoted Cholesky Decomposition
+Version: 0.0.0.9000
+Authors@R: 
+    person("Stéfan", "Janse van Rensburg", , "stefanj@mandala.ac.za", role = c("aut", "cre"),
+           comment = c(ORCID = "0000-0002-0749-2277"))
+Description: An efficient implementation of the Accelerated Randomly Pivoted Cholesky 
+    algorithm for low-rank approximation of large positive semi-definite matrices.
+    This package provides both R and C++ interfaces for use in various applications.
+License: GPL (>= 3)
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+Imports:
+    Rcpp,
+    methods
+LinkingTo:
+    Rcpp,
+    RcppArmadillo
