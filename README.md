@@ -96,6 +96,16 @@ print(estimation$optimal_rank)
 - **DESCRIPTION**: Package metadata.
 - **NAMESPACE**: Export and import directives.
 
+## References and Acknowledgements
+
+The implementation in this package is based on the following work:
+
+- **Chen, Y., Epperly, E. N., Tropp, J. A., & Webber, R. J. (2023).** *Randomly pivoted Cholesky: Practical approximation of a kernel matrix with few entry evaluations.* [arXiv:2207.06503](https://arxiv.org/abs/2207.06503).
+
+- **Epperly, E. N., Tropp, J. A., & Webber, R. J. (2024).** *Embrace rejection: Kernel matrix approximation by accelerated randomly pivoted Cholesky.* Manuscript in preparation.
+
+This code is also based on the implementation available at [https://github.com/eepperly/Randomly-Pivoted-Cholesky](https://github.com/eepperly/Randomly-Pivoted-Cholesky).
+
 ## License
 
 The `rpcholesky` package is licensed under the GNU General Public License version 3 (GPL-3).
