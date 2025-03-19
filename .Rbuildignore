@@ -1,3 +1,6 @@
 ^rpcholesky\.Rproj$
 ^\.Rproj\.user$
 ^LICENSE\.md$
+^examples$
+^tools$
+^README\.md$

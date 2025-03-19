@@ -18,6 +18,7 @@ rpcholesky <- function(A, k, b = "auto", stoptol = 1e-10, verbose = FALSE) {
   if (!is.matrix(A)) {
     A <- as.matrix(A)
   }
+  # Call the C++ implementation
   result <- accelerated_rpcholesky(A, k, b, stoptol, verbose)
   return(result)
 }

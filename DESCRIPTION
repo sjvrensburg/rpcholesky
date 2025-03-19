@@ -13,7 +13,12 @@ Roxygen: list(markdown = TRUE)
 RoxygenNote: 7.3.2
 Imports:
     Rcpp,
-    methods
+    methods,
+    ggplot2,
+    reshape2,
+    gridExtra
 LinkingTo:
     Rcpp,
     RcppArmadillo
+URL: https://github.com/sjvrensburg/rpcholesky
+BugReports: https://github.com/sjvrensburg/rpcholesky/issues
